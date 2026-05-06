@@ -923,21 +923,43 @@ async def resolve_stream(payload: dict, request: Request, config: str = ""):
 @app.post("/cache/resolve")
 @app.post("/{config}/cache/resolve")
 async def cache_resolve(payload: dict, request: Request, config: str = ""):
-    source_payload = payload.get("source_payload") or {}
-    filename = source_payload.get("filename") or ""
+    # The orchestrator posts `{ entry: <full library entry> }`, NOT a
+    # bare source_payload. The previous version read payload.source_payload
+    # directly, which always returned None and 400'd. Plus the response
+    # used snake_case `stream_url` while the orchestrator only reads
+    # `streamUrl` — so even if the lookup had worked, playback would still
+    # have failed silently.
+    entry = payload.get("entry") or {}
+    source_payload = entry.get("source_payload") or {}
+    filename = (source_payload.get("filename")
+                or source_payload.get("short_name")
+                or entry.get("filename") or "")
     short_name = filename.replace("\\", "/").split("/")[-1].strip()
     if not short_name:
-        raise HTTPException(400, "source_payload.filename required")
+        raise HTTPException(400, "entry.source_payload.filename required")
 
     local_path = await _find_local_file(short_name)
     if not local_path:
-        raise HTTPException(404, "File not found locally — may have been moved or deleted.")
+        # Surface as a soft "missing" signal so the orchestrator can
+        # prompt the user to re-download instead of dropping the entry.
+        return {
+            "local_file_missing": True,
+            "expected_path": short_name,
+            "redispatch_payload": {
+                "source": source_payload,
+                "track": entry.get("track_payload") or {},
+            },
+        }
 
     ext_dot = os.path.splitext(short_name)[1].lower()
     ext = ext_dot.lstrip(".")
     mime = _AUDIO_MIME.get(ext, "audio/mpeg")
-    stream_url = f"/slskd/file/{urllib.parse.quote(short_name, safe='')}"
-    return {"stream_url": stream_url, "mime_type": mime, "source": "Soulseek"}
+    return {
+        "streamUrl": f"/slskd/file/{urllib.parse.quote(short_name, safe='')}",
+        "streamUrlRelative": True,
+        "mimeType": mime,
+        "source": "Soulseek",
+    }
 
 
 # ──────────────────────────────────────────────────────────────────
