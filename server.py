@@ -135,6 +135,11 @@ _SLSKD_CFG      = os.path.join(_SLSKD_HOME, "slskd.yml")
 _SLSKD_DL_DIR   = os.path.join(_SLSKD_HOME, "downloads")
 _SLSKD_INC_DIR  = os.path.join(_SLSKD_HOME, "incomplete")
 _SLSKD_PORT     = 5030
+# slskd's Soulseek peer listen port. Configurable in slskd.yml as
+# `soulseek.listen_port` but we leave it at the upstream default — both
+# ports are checked at preflight and the user gets a clear error if
+# they're already bound.
+_SLSKD_PEER_PORT = 50300
 _SLSKD_URL_BASE = f"http://127.0.0.1:{_SLSKD_PORT}"
 _LAUNCHD_LABEL  = "com.audimo.slskd-runtime"
 _LAUNCHD_PLIST  = os.path.expanduser(f"~/Library/LaunchAgents/{_LAUNCHD_LABEL}.plist")
@@ -265,6 +270,94 @@ async def _slskd_auth_headers(cfg: dict) -> dict:
 # ──────────────────────────────────────────────────────────────────
 # Managed slskd install helpers
 # ──────────────────────────────────────────────────────────────────
+def _port_in_use(port: int) -> tuple[bool, str | None]:
+    """(in_use, listener_process_name_or_None).
+
+    A bind probe is the cheapest "is anyone there" check. If it fails
+    we follow up with `lsof` to name the listener so error messages can
+    be specific (e.g. "com.docker.backend" vs "unknown"). lsof not
+    being available is fine — we just lose the name.
+    """
+    import socket
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 0)
+    try:
+        s.bind(("127.0.0.1", port))
+        s.close()
+        return False, None
+    except OSError:
+        pass
+    finally:
+        try: s.close()
+        except Exception: pass
+    proc = None
+    try:
+        r = subprocess.run(
+            ["lsof", "-nP", "-iTCP:%d" % port, "-sTCP:LISTEN", "-F", "c"],
+            capture_output=True, text=True, timeout=2,
+        )
+        for line in (r.stdout or "").splitlines():
+            if line.startswith("c"):
+                proc = line[1:].strip()
+                break
+    except Exception:
+        pass
+    return True, proc
+
+
+def _docker_slskd_container() -> str | None:
+    """If the slskd/slskd Docker image is running, return the container name.
+
+    Lets the install flow give a targeted "stop your Docker slskd"
+    message instead of just "port 5030 in use". Silent when Docker
+    isn't installed or isn't running — we just fall back to the
+    generic process name.
+    """
+    try:
+        r = subprocess.run(
+            ["docker", "ps", "--filter", "ancestor=slskd/slskd",
+             "--format", "{{.Names}}"],
+            capture_output=True, text=True, timeout=3,
+        )
+        names = [n for n in (r.stdout or "").strip().splitlines() if n]
+        return names[0] if names else None
+    except Exception:
+        return None
+
+
+def _preflight_ports() -> dict:
+    """Check whether slskd's web + peer ports are free.
+
+    {ok, conflicts: [{port, label, process}], docker_slskd}.
+    Used by the install endpoint to refuse early with a clear message
+    rather than landing the user in a config that won't bind.
+    """
+    conflicts = []
+    for port, label in [(_SLSKD_PORT, "web"), (_SLSKD_PEER_PORT, "soulseek peer")]:
+        in_use, proc = _port_in_use(port)
+        if in_use:
+            conflicts.append({"port": port, "label": label, "process": proc or "unknown"})
+    docker_name = _docker_slskd_container() if conflicts else None
+    return {
+        "ok": len(conflicts) == 0,
+        "conflicts": conflicts,
+        "docker_slskd": docker_name,
+    }
+
+
+def _preflight_error_message(pre: dict) -> str:
+    """Human-readable explanation of a failed preflight."""
+    if pre.get("docker_slskd"):
+        ports = ", ".join(str(c["port"]) for c in pre["conflicts"])
+        return (f"You already have slskd running in Docker (container "
+                f"'{pre['docker_slskd']}'). Stop it first — Audimo's slskd "
+                f"needs port{'s' if len(pre['conflicts']) > 1 else ''} "
+                f"{ports}. Run: docker stop {pre['docker_slskd']}")
+    details = ", ".join(f"{c['port']} ({c['process']})" for c in pre["conflicts"])
+    return (f"Required port{'s' if len(pre['conflicts']) > 1 else ''} in use: "
+            f"{details}. Free them and try again.")
+
+
 def _slskd_installed() -> bool:
     return os.path.isfile(_SLSKD_BIN) and os.access(_SLSKD_BIN, os.X_OK)
 
@@ -876,6 +969,7 @@ async def slskd_status():
     connected = False
     soulseek_username = ""
     slskd_version_str = version
+    http_reachable = False
 
     if installed:
         try:
@@ -885,6 +979,7 @@ async def slskd_status():
                     f"{_SLSKD_URL_BASE}/api/v0/application", headers=auth
                 )
                 if r.status_code == 200:
+                    http_reachable = True
                     d = r.json()
                     server = d.get("server", {})
                     connected = "Connected" in server.get("state", "")
@@ -893,13 +988,30 @@ async def slskd_status():
         except Exception:
             pass
 
-    return {
+    out = {
         "installed": installed,
-        "running": connected or (installed and slskd_version_str is not None),
+        # `running` was previously true whenever the binary existed
+        # because `_slskd_version()` shells out and answers without a
+        # daemon — but the UI needs to distinguish "binary present but
+        # daemon down" from "daemon up". Tie this to a real HTTP probe.
+        "running": http_reachable,
         "connected": connected,
         "version": slskd_version_str,
         "soulseek_username": soulseek_username,
     }
+    # When installed but the daemon doesn't respond, attach a preflight
+    # so the UI can name the offender (port conflict, docker slskd) instead
+    # of just showing "not running".
+    if installed and not http_reachable:
+        out["preflight"] = _preflight_ports()
+    return out
+
+
+@app.get("/slskd/preflight")
+async def slskd_preflight():
+    """Surface port conflicts so the configure UI can show a targeted
+    hint when the user's slskd isn't running."""
+    return _preflight_ports()
 
 
 @app.get("/slskd/latest-release")
@@ -917,6 +1029,14 @@ async def slskd_install(payload: dict = {}):
     soulseek_password = (payload.get("soulseek_password") or "").strip()
 
     async def gen():
+        # Pre-flight before downloading 100MB+ — port collisions show
+        # up clearly here rather than as a cryptic launchd failure.
+        yield _sse({"type": "progress", "pct": 2, "message": "Checking ports…"})
+        pre = _preflight_ports()
+        if not pre["ok"]:
+            yield _sse({"type": "error", "message": _preflight_error_message(pre)})
+            return
+
         yield _sse({"type": "progress", "pct": 5, "message": "Fetching latest slskd release…"})
 
         release = await _github_latest_release()
@@ -957,17 +1077,17 @@ async def slskd_install(payload: dict = {}):
 
             yield _sse({"type": "progress", "pct": 62, "message": "Extracting…"})
 
+            # The slskd zip ships the binary alongside `wwwroot/` (web
+            # UI assets) and `config/` (example yml). slskd refuses to
+            # start without wwwroot present at the configured ContentPath
+            # (defaults to <install_dir>/wwwroot), so extract the whole
+            # archive and not just the binary.
             with zipfile.ZipFile(tmp_path) as zf:
-                slskd_members = [m for m in zf.namelist()
-                                 if os.path.basename(m) == "slskd" and not m.endswith("/")]
-                if not slskd_members:
-                    slskd_members = [m for m in zf.namelist() if "slskd" in m.lower() and not m.endswith("/")]
-                if not slskd_members:
+                names = [m for m in zf.namelist() if not m.endswith("/")]
+                if not any(os.path.basename(n) == "slskd" for n in names):
                     yield _sse({"type": "error", "message": "Could not find slskd binary in zip."})
                     return
-                member = slskd_members[0]
-                with zf.open(member) as src, open(_SLSKD_BIN, "wb") as dst:
-                    dst.write(src.read())
+                zf.extractall(_SLSKD_HOME)
 
             os.chmod(_SLSKD_BIN, 0o755)
             yield _sse({"type": "progress", "pct": 70, "message": "Configuring slskd…"})
@@ -1049,17 +1169,15 @@ async def slskd_update():
             await asyncio.sleep(2)
 
             yield _sse({"type": "progress", "pct": 72, "message": "Replacing binary…"})
+            # Refresh wwwroot too — slskd's web UI assets are versioned
+            # with the binary, so an upgrade with a stale wwwroot would
+            # serve the old UI (or fail validation if the manifest moves).
             with zipfile.ZipFile(tmp_path) as zf:
-                slskd_members = [m for m in zf.namelist()
-                                 if os.path.basename(m) == "slskd" and not m.endswith("/")]
-                if not slskd_members:
-                    slskd_members = [m for m in zf.namelist() if "slskd" in m.lower() and not m.endswith("/")]
-                if not slskd_members:
+                names = [m for m in zf.namelist() if not m.endswith("/")]
+                if not any(os.path.basename(n) == "slskd" for n in names):
                     yield _sse({"type": "error", "message": "Could not find slskd binary in zip."})
                     return
-                member = slskd_members[0]
-                with zf.open(member) as src, open(_SLSKD_BIN, "wb") as dst:
-                    dst.write(src.read())
+                zf.extractall(_SLSKD_HOME)
             os.chmod(_SLSKD_BIN, 0o755)
 
             yield _sse({"type": "progress", "pct": 88, "message": "Restarting slskd…"})
@@ -1257,9 +1375,22 @@ async function loadStatus() {
     if (s.connected) {
       connDot.className = 'dot green';
       connLabel.textContent = `Connected as ${s.soulseek_username || '(unknown)'}`;
-    } else if (s.installed) {
+    } else if (s.installed && s.running) {
       connDot.className = 'dot yellow';
       connLabel.textContent = 'slskd running but not connected to Soulseek';
+    } else if (s.installed) {
+      // Binary present but the daemon isn't answering. Surface the
+      // most likely cause if preflight found something.
+      connDot.className = 'dot red';
+      const pf = s.preflight;
+      if (pf && pf.docker_slskd) {
+        connLabel.textContent = `slskd not running — Docker container '${pf.docker_slskd}' is using the ports. Stop it and restart.`;
+      } else if (pf && pf.conflicts && pf.conflicts.length) {
+        const c = pf.conflicts.map(x => `${x.port} (${x.process})`).join(', ');
+        connLabel.textContent = `slskd not running — port(s) in use: ${c}`;
+      } else {
+        connLabel.textContent = 'slskd not running — check the log at ~/.audimo/slskd/slskd.log';
+      }
     } else {
       connDot.className = 'dot gray';
       connLabel.textContent = 'Install slskd first';
