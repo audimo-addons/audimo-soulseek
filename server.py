@@ -37,7 +37,7 @@ from fastapi.responses import (
 MANIFEST = {
     "id": "audimo-soulseek",
     "name": "Audimo Soulseek",
-    "version": "0.1.0",
+    "version": "0.1.6",
     "description": (
         "Install and configure slskd, then search Soulseek peers "
         "directly from Audimo's source picker."
@@ -965,6 +965,23 @@ async def resolve_stream(payload: dict, request: Request, config: str = ""):
     source = payload.get("source") or {}
     track = payload.get("track") or {}
     cfg = _config_from(request, payload)
+
+    # Diagnostic — appended to ~/.audimo/slskd/resolve_stream.debug.log
+    # so we can see what the frontend actually sends. Track metadata
+    # determines whether files land at <Artist>/<Album>/<Title> or in
+    # _Unsorted; if track is empty here, the bug is upstream.
+    try:
+        import json as _json
+        os.makedirs(_SLSKD_HOME, exist_ok=True)
+        with open(os.path.join(_SLSKD_HOME, "resolve_stream.debug.log"), "a") as _f:
+            _f.write(_json.dumps({
+                "ts": int(_time.time()),
+                "track": track,
+                "source_keys": list(source.keys()),
+                "payload_keys": list(payload.keys()),
+            }) + "\n")
+    except Exception:
+        pass
 
     async def gen():
         async for ev in _stream_events(source, track, cfg):
