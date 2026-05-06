@@ -886,18 +886,13 @@ async def _stream_events(source: dict, track: dict, cfg: dict):
                     "message": "Download timed out — try a different source."})
         return
 
-    title = (track.get("title") or "").strip()
-    artist = (track.get("artist") or "").strip()
-    album = (track.get("album") or "").strip()
-    kind = (track.get("kind") or "").strip()
-    dest_dir = _audiobooks_dir({}) if kind == "audiobook" else _music_dir({})
-    rel = _organized_relpath(kind, title, artist, album, ext_dot)
-    dest = os.path.join(dest_dir, rel)
-    os.makedirs(os.path.dirname(dest), exist_ok=True)
-    if not os.path.exists(dest):
-        shutil.copy2(local_path, dest)
-
-    stream_url = f"/slskd/file/{urllib.parse.quote(os.path.basename(dest), safe='')}"
+    # Stream URL serves from the slskd downloads directory using the
+    # original filename — that's what `_find_local_file` walks. The
+    # earlier version emitted `basename(dest)` (the organized
+    # filename), which 404'd because the slskd downloads dir still had
+    # the original name. cache.resolve below already does the right
+    # thing; this brings resolve.stream into agreement.
+    stream_url = f"/slskd/file/{urllib.parse.quote(short_name, safe='')}"
     yield _sse({
         "type": "ready",
         "status": "done",
