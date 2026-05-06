@@ -41,9 +41,10 @@ jobs:
           - os: macos-14
             target: darwin-arm64
             artifact: audimo-soulseek-darwin-arm64
-          - os: macos-13
-            target: darwin-x64
-            artifact: audimo-soulseek-darwin-x64
+          # darwin-x64 (Intel Mac) intentionally omitted — macos-13
+          # runners are capacity-constrained on free CI and Intel Macs
+          # are a niche we don't have users for yet. Re-add when there's
+          # demand; the manifest will simply lack a darwin-x64 entry.
           - os: ubuntu-latest
             target: linux-x64
             artifact: audimo-soulseek-linux-x64
@@ -134,10 +135,6 @@ jobs:
                 "url": "${BASE}/audimo-soulseek-darwin-arm64",
                 "sha256": "$(read_sha audimo-soulseek-darwin-arm64)"
               },
-              "darwin-x64": {
-                "url": "${BASE}/audimo-soulseek-darwin-x64",
-                "sha256": "$(read_sha audimo-soulseek-darwin-x64)"
-              },
               "linux-x64": {
                 "url": "${BASE}/audimo-soulseek-linux-x64",
                 "sha256": "$(read_sha audimo-soulseek-linux-x64)"
@@ -159,8 +156,6 @@ jobs:
           files: |
             out/audimo-soulseek-darwin-arm64
             out/audimo-soulseek-darwin-arm64.sha256
-            out/audimo-soulseek-darwin-x64
-            out/audimo-soulseek-darwin-x64.sha256
             out/audimo-soulseek-linux-x64
             out/audimo-soulseek-linux-x64.sha256
             out/audimo-soulseek-win32-x64.exe
