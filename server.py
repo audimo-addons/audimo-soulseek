@@ -901,6 +901,8 @@ async def _stream_events(source: dict, track: dict, cfg: dict):
         base_no_ext = os.path.splitext(os.path.basename(local_path))[0]
         rel = os.path.join("_Unsorted", base_no_ext + ext_dot)
     dest = os.path.join(dest_dir, rel)
+    slskd_src_dir = os.path.dirname(local_path)
+    moved = False
     try:
         os.makedirs(os.path.dirname(dest), exist_ok=True)
         if os.path.realpath(local_path) != os.path.realpath(dest):
@@ -911,12 +913,38 @@ async def _stream_events(source: dict, track: dict, cfg: dict):
                 except Exception: pass
             else:
                 shutil.move(local_path, dest)
+            moved = True
         local_path = dest
     except Exception as e:
         # If the move fails (perms, full disk, etc.) we fall through to
         # serving from wherever the file currently is — playback still
         # works, the user just doesn't get the organized layout.
         print(f"[soulseek] organize failed: {e}", flush=True)
+
+    # Clean up the slskd side once the file is in the library.
+    # `shutil.move` removes the source file; we still need to rmdir
+    # the now-empty per-album directory slskd creates, and tell slskd
+    # to forget the transfer so its UI/DB doesn't keep listing it.
+    if moved:
+        try:
+            # Only rmdir if it's empty AND inside _SLSKD_DL_DIR — never
+            # walk above the configured root.
+            if (os.path.commonpath([slskd_src_dir, _SLSKD_DL_DIR]) == _SLSKD_DL_DIR
+                    and os.path.realpath(slskd_src_dir) != os.path.realpath(_SLSKD_DL_DIR)
+                    and not os.listdir(slskd_src_dir)):
+                os.rmdir(slskd_src_dir)
+        except Exception:
+            pass
+        if transfer_id:
+            try:
+                async with httpx.AsyncClient(timeout=5) as client:
+                    await client.delete(
+                        f"{_SLSKD_URL_BASE}/api/v0/transfers/downloads/{username}/{transfer_id}",
+                        headers=auth,
+                        params={"remove": "true"},
+                    )
+            except Exception:
+                pass
 
     stream_url = "/slskd/file?path=" + urllib.parse.quote(local_path, safe="")
     yield _sse({
