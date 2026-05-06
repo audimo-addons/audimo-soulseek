@@ -886,20 +886,48 @@ async def _stream_events(source: dict, track: dict, cfg: dict):
                     "message": "Download timed out — try a different source."})
         return
 
-    # Stream URL serves from the slskd downloads directory using the
-    # original filename — that's what `_find_local_file` walks. The
-    # earlier version emitted `basename(dest)` (the organized
-    # filename), which 404'd because the slskd downloads dir still had
-    # the original name. cache.resolve below already does the right
-    # thing; this brings resolve.stream into agreement.
-    stream_url = f"/slskd/file/{urllib.parse.quote(short_name, safe='')}"
+    # Move into the user's library so files end up at
+    # ~/Music/Audimo/<Artist>/<Album>/<Title>.<ext>. Falls back to a
+    # flat _Unsorted dir when track metadata is empty so the bad
+    # "Unknown/Unknown" collapse can't happen.
+    title = (track.get("title") or "").strip()
+    artist = (track.get("artist") or "").strip()
+    album = (track.get("album") or "").strip()
+    kind = (track.get("kind") or "").strip()
+    dest_dir = _audiobooks_dir({}) if kind == "audiobook" else _music_dir({})
+    if title and artist:
+        rel = _organized_relpath(kind, title, artist, album, ext_dot)
+    else:
+        base_no_ext = os.path.splitext(os.path.basename(local_path))[0]
+        rel = os.path.join("_Unsorted", base_no_ext + ext_dot)
+    dest = os.path.join(dest_dir, rel)
+    try:
+        os.makedirs(os.path.dirname(dest), exist_ok=True)
+        if os.path.realpath(local_path) != os.path.realpath(dest):
+            if os.path.exists(dest) and os.path.getsize(dest) >= os.path.getsize(local_path):
+                # Library copy already complete from a prior play —
+                # drop the slskd-side dupe to avoid two-of-everything.
+                try: os.remove(local_path)
+                except Exception: pass
+            else:
+                shutil.move(local_path, dest)
+        local_path = dest
+    except Exception as e:
+        # If the move fails (perms, full disk, etc.) we fall through to
+        # serving from wherever the file currently is — playback still
+        # works, the user just doesn't get the organized layout.
+        print(f"[soulseek] organize failed: {e}", flush=True)
+
+    stream_url = "/slskd/file?path=" + urllib.parse.quote(local_path, safe="")
     yield _sse({
         "type": "ready",
         "status": "done",
         "streamUrl": stream_url,
+        "streamUrlRelative": True,
         "mimeType": mime,
         "source": "Soulseek",
         "addon_id": MANIFEST["id"],
+        "addon_local_file": local_path,
     })
 
 
@@ -931,49 +959,116 @@ async def cache_resolve(payload: dict, request: Request, config: str = ""):
     # have failed silently.
     entry = payload.get("entry") or {}
     source_payload = entry.get("source_payload") or {}
+    # Prefer the path the addon recorded at resolve-time. Falls back
+    # to walking the slskd dir by short_name for entries saved before
+    # the path-based scheme landed (v0.1.x → v0.2.x migration).
+    recorded_path = (entry.get("addon_local_file")
+                     or entry.get("local_file")
+                     or source_payload.get("addon_local_file") or "")
     filename = (source_payload.get("filename")
                 or source_payload.get("short_name")
                 or entry.get("filename") or "")
     short_name = filename.replace("\\", "/").split("/")[-1].strip()
-    if not short_name:
-        raise HTTPException(400, "entry.source_payload.filename required")
 
-    local_path = await _find_local_file(short_name)
-    if not local_path:
-        # Surface as a soft "missing" signal so the orchestrator can
-        # prompt the user to re-download instead of dropping the entry.
+    real = ""
+    if recorded_path:
+        real = os.path.realpath(recorded_path)
+        if not os.path.exists(real):
+            real = ""
+    if not real and short_name:
+        found = await _find_local_file(short_name)
+        if found:
+            real = os.path.realpath(found)
+
+    if not real:
         return {
             "local_file_missing": True,
-            "expected_path": short_name,
+            "expected_path": recorded_path or short_name,
             "redispatch_payload": {
                 "source": source_payload,
                 "track": entry.get("track_payload") or {},
             },
         }
 
-    ext_dot = os.path.splitext(short_name)[1].lower()
-    ext = ext_dot.lstrip(".")
+    ext = os.path.splitext(real)[1].lower().lstrip(".")
     mime = _AUDIO_MIME.get(ext, "audio/mpeg")
     return {
-        "streamUrl": f"/slskd/file/{urllib.parse.quote(short_name, safe='')}",
+        "streamUrl": "/slskd/file?path=" + urllib.parse.quote(real, safe=""),
         "streamUrlRelative": True,
         "mimeType": mime,
         "source": "Soulseek",
+        "addon_local_file": real,
     }
 
 
 # ──────────────────────────────────────────────────────────────────
 # /slskd/file — serve completed download from disk
 # ──────────────────────────────────────────────────────────────────
+def _serve_local(real: str) -> Response:
+    """Allow-list–validated FileResponse helper.
+
+    Restricts the served path to the slskd downloads dir, the user's
+    music dir, and the audiobooks dir. Anything outside is 403 — the
+    endpoint is reachable from a browser, so we never trust the path
+    parameter to be safe just because the host is loopback.
+    """
+    allowed_roots = []
+    for d in (_SLSKD_DL_DIR, _music_dir({}), _audiobooks_dir({})):
+        try: allowed_roots.append(os.path.realpath(d))
+        except Exception: pass
+    inside = False
+    for root in allowed_roots:
+        try:
+            if os.path.commonpath([real, root]) == root:
+                inside = True
+                break
+        except (ValueError, OSError):
+            continue
+    if not inside:
+        return Response(status_code=403)
+    if not os.path.exists(real):
+        return Response(status_code=404)
+    ext = os.path.splitext(real)[1].lower().lstrip(".")
+    mime = _AUDIO_MIME.get(ext, "audio/mpeg")
+    return FileResponse(real, media_type=mime, filename=os.path.basename(real))
+
+
+@app.get("/slskd/file")
+async def slskd_file_query(path: str = ""):
+    """Path-based serve — primary route. Used by current resolve.stream
+    + cache.resolve so library entries can replay reliably whether the
+    file lives in the slskd downloads dir or the organized music dir."""
+    if not path:
+        return Response(status_code=400)
+    return _serve_local(os.path.realpath(path))
+
+
 @app.get("/slskd/file/{filename:path}")
-async def slskd_file(filename: str):
+async def slskd_file_legacy(filename: str):
+    """Legacy basename route for entries saved by older addon versions.
+
+    Walks both the slskd downloads dir and the music/audiobooks dirs so
+    pre-organize entries (only in slskd) and organized entries that
+    happen to keep their original name (rare) both resolve.
+    """
     safe = os.path.basename(filename)
     local_path = await _find_local_file(safe)
     if not local_path:
-        raise HTTPException(404, "File not found")
-    ext = os.path.splitext(safe)[1].lower().lstrip(".")
-    mime = _AUDIO_MIME.get(ext, "audio/mpeg")
-    return FileResponse(local_path, media_type=mime)
+        # Look in music/audiobooks dirs too — entries from older
+        # versions that put the renamed file there.
+        for d in (_music_dir({}), _audiobooks_dir({})):
+            try:
+                for root, _dirs, files in os.walk(d):
+                    if safe in files:
+                        local_path = os.path.realpath(os.path.join(root, safe))
+                        break
+            except Exception:
+                continue
+            if local_path:
+                break
+    if not local_path:
+        return Response(status_code=404)
+    return _serve_local(os.path.realpath(local_path))
 
 
 # ──────────────────────────────────────────────────────────────────
