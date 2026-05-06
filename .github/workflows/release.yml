@@ -1,0 +1,169 @@
+name: release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version to publish (without leading v)'
+        required: true
+        default: '0.1.0'
+
+permissions:
+  contents: write
+
+jobs:
+  smoke:
+    name: import smoke
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+          cache-dependency-path: requirements.txt
+      - run: pip install -r requirements.txt
+      - run: python -c "from server import app; print('routes:', len(app.routes))"
+
+  build:
+    needs: smoke
+    name: build (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-14
+            target: darwin-arm64
+            artifact: audimo-soulseek-darwin-arm64
+          - os: macos-13
+            target: darwin-x64
+            artifact: audimo-soulseek-darwin-x64
+          - os: ubuntu-latest
+            target: linux-x64
+            artifact: audimo-soulseek-linux-x64
+          - os: windows-latest
+            target: win32-x64
+            artifact: audimo-soulseek-win32-x64.exe
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pyinstaller
+      - name: Build
+        run: pyinstaller audimo_soulseek.spec --clean --noconfirm
+      - name: Rename artifact (Unix)
+        if: matrix.os != 'windows-latest'
+        run: mv dist/audimo-soulseek dist/${{ matrix.artifact }}
+      - name: Rename artifact (Windows)
+        if: matrix.os == 'windows-latest'
+        run: Rename-Item -Path dist\audimo-soulseek.exe -NewName ${{ matrix.artifact }}
+        shell: pwsh
+      - name: Compute SHA256 (Unix)
+        if: matrix.os != 'windows-latest'
+        run: shasum -a 256 dist/${{ matrix.artifact }} | awk '{print $1}' > dist/${{ matrix.artifact }}.sha256
+      - name: Compute SHA256 (Windows)
+        if: matrix.os == 'windows-latest'
+        run: |
+          $hash = (Get-FileHash -Algorithm SHA256 -Path "dist\${{ matrix.artifact }}").Hash.ToLower()
+          $hash | Out-File -Encoding ascii -NoNewline "dist\${{ matrix.artifact }}.sha256"
+        shell: pwsh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: |
+            dist/${{ matrix.artifact }}
+            dist/${{ matrix.artifact }}.sha256
+          if-no-files-found: error
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+      - name: Resolve version + flatten artifacts
+        id: meta
+        run: |
+          set -euo pipefail
+          REF="${GITHUB_REF##*/}"
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            VERSION="${{ github.event.inputs.version }}"
+          else
+            VERSION="${REF#v}"
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          mkdir -p out
+          find artifacts -mindepth 2 -type f -exec cp {} out/ \;
+          ls -la out/
+      - name: Build manifest.json
+        run: |
+          set -euo pipefail
+          VERSION="${{ steps.meta.outputs.version }}"
+          REPO="${GITHUB_REPOSITORY}"
+          BASE="https://github.com/${REPO}/releases/download/v${VERSION}"
+          read_sha() { cat "out/${1}.sha256"; }
+          cat > out/manifest.json <<EOF
+          {
+            "schema_version": 1,
+            "id": "audimo-soulseek",
+            "name": "Audimo Soulseek",
+            "version": "${VERSION}",
+            "description": "Install slskd and search Soulseek peers from Audimo's source picker.",
+            "capabilities": [
+              "resolve.sources",
+              "resolve.sources.stream",
+              "resolve.stream",
+              "cache.resolve"
+            ],
+            "binaries": {
+              "darwin-arm64": {
+                "url": "${BASE}/audimo-soulseek-darwin-arm64",
+                "sha256": "$(read_sha audimo-soulseek-darwin-arm64)"
+              },
+              "darwin-x64": {
+                "url": "${BASE}/audimo-soulseek-darwin-x64",
+                "sha256": "$(read_sha audimo-soulseek-darwin-x64)"
+              },
+              "linux-x64": {
+                "url": "${BASE}/audimo-soulseek-linux-x64",
+                "sha256": "$(read_sha audimo-soulseek-linux-x64)"
+              },
+              "win32-x64": {
+                "url": "${BASE}/audimo-soulseek-win32-x64.exe",
+                "sha256": "$(read_sha audimo-soulseek-win32-x64.exe)"
+              }
+            },
+            "default_settings": {}
+          }
+          EOF
+          cat out/manifest.json
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ steps.meta.outputs.version }}
+          name: v${{ steps.meta.outputs.version }}
+          files: |
+            out/audimo-soulseek-darwin-arm64
+            out/audimo-soulseek-darwin-arm64.sha256
+            out/audimo-soulseek-darwin-x64
+            out/audimo-soulseek-darwin-x64.sha256
+            out/audimo-soulseek-linux-x64
+            out/audimo-soulseek-linux-x64.sha256
+            out/audimo-soulseek-win32-x64.exe
+            out/audimo-soulseek-win32-x64.exe.sha256
+            out/manifest.json
+          fail_on_unmatched_files: true
