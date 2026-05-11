@@ -102,9 +102,78 @@ MANIFEST = {
 # App + middleware
 # ──────────────────────────────────────────────────────────────────
 app = FastAPI(title=MANIFEST["name"], version=MANIFEST["version"])
+# ── DNS-rebinding defense + tightened CORS ───────────────────────
+# Mirror of audimo-aio. See that file for the full rationale.
+import ipaddress as _ipaddress
+import re as _re
+
+_BIND_HOST = (
+    os.environ.get("AUDIMO_ADDON_HOST")
+    or os.environ.get("TUNNEL_ADDON_HOST")
+    or "127.0.0.1"
+).strip()
+_REMOTE_BIND = _BIND_HOST == "0.0.0.0"
+_TRUSTED_HOSTS_ENV = {
+    h.strip().lower()
+    for h in (os.environ.get("AUDIMO_ADDON_TRUSTED_HOSTS") or "").split(",")
+    if h.strip()
+}
+_LOOPBACK_HOSTS = {"127.0.0.1", "localhost", "::1"}
+_REMOTE_HOST_RE = _re.compile(
+    r"^([\w-]+\.)*(local|lan|home)$|^([\w-]+\.)*ts\.net$",
+    _re.IGNORECASE,
+)
+
+
+def _strip_host_port(host_header: str) -> str:
+    h = (host_header or "").strip()
+    if h.startswith("["):
+        idx = h.find("]")
+        return h[1:idx].lower() if idx > 0 else h.lower()
+    if ":" in h:
+        return h.split(":", 1)[0].lower()
+    return h.lower()
+
+
+def _host_allowed(host_header: str) -> bool:
+    h = _strip_host_port(host_header)
+    if not h:
+        return False
+    if h in _LOOPBACK_HOSTS or h in _TRUSTED_HOSTS_ENV:
+        return True
+    if not _REMOTE_BIND:
+        return False
+    try:
+        ip = _ipaddress.ip_address(h)
+        return ip.is_private or ip.is_loopback
+    except ValueError:
+        pass
+    return bool(_REMOTE_HOST_RE.match(h))
+
+
+@app.middleware("http")
+async def _host_allowlist(request: Request, call_next):
+    if not _host_allowed(request.headers.get("host", "")):
+        from fastapi.responses import JSONResponse
+        return JSONResponse({"detail": "Host not allowed"}, status_code=421)
+    return await call_next(request)
+
+
+_CORS_EXTRA = [
+    o.strip()
+    for o in (os.environ.get("AUDIMO_ADDON_CORS_EXTRA") or "").split(",")
+    if o.strip()
+]
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origin_regex=(
+        r"^(https?://(localhost|127\.0\.0\.1|\[::1\])(:\d+)?"
+        r"|(tauri|app)://([\w-]+\.)?localhost"
+        r"|https?://([\w-]+\.)?(local|lan|home)(:\d+)?"
+        r"|https?://([\w-]+\.)*ts\.net(:\d+)?)$"
+    ),
+    allow_origins=_CORS_EXTRA,
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )

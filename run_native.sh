@@ -10,10 +10,11 @@ if [[ ! -d .venv ]]; then
   .venv/bin/pip install --quiet -r requirements.txt
 fi
 
-echo "[run] starting audimo-soulseek on http://0.0.0.0:9008"
+ADDON_HOST="${AUDIMO_ADDON_HOST:-${TUNNEL_ADDON_HOST:-127.0.0.1}}"
+echo "[run] starting audimo-soulseek on http://${ADDON_HOST}:9008"
 
 exec .venv/bin/uvicorn server:app \
-  --host 0.0.0.0 \
+  --host "${ADDON_HOST}" \
   --port 9008 \
   --proxy-headers \
   --no-access-log \
