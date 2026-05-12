@@ -1174,7 +1174,11 @@ async def slskd_file_legacy(filename: str):
 @app.get("/slskd/status")
 async def slskd_status():
     installed = _slskd_installed()
-    version = _slskd_version() if installed else None
+    # subprocess.run inside async handlers blocks the event loop while
+    # the child process runs (slskd --version is fast, lsof can be
+    # slow under load). Wrap in asyncio.to_thread so unrelated
+    # requests stay responsive during the probe.
+    version = await asyncio.to_thread(_slskd_version) if installed else None
     connected = False
     soulseek_username = ""
     slskd_version_str = version
@@ -1212,7 +1216,7 @@ async def slskd_status():
     # so the UI can name the offender (port conflict, docker slskd) instead
     # of just showing "not running".
     if installed and not http_reachable:
-        out["preflight"] = _preflight_ports()
+        out["preflight"] = await asyncio.to_thread(_preflight_ports)
     return out
 
 
@@ -1220,7 +1224,7 @@ async def slskd_status():
 async def slskd_preflight():
     """Surface port conflicts so the configure UI can show a targeted
     hint when the user's slskd isn't running."""
-    return _preflight_ports()
+    return await asyncio.to_thread(_preflight_ports)
 
 
 @app.get("/slskd/latest-release")
@@ -1241,7 +1245,7 @@ async def slskd_install(payload: dict = {}):
         # Pre-flight before downloading 100MB+ — port collisions show
         # up clearly here rather than as a cryptic launchd failure.
         yield _sse({"type": "progress", "pct": 2, "message": "Checking ports…"})
-        pre = _preflight_ports()
+        pre = await asyncio.to_thread(_preflight_ports)
         if not pre["ok"]:
             yield _sse({"type": "error", "message": _preflight_error_message(pre)})
             return
