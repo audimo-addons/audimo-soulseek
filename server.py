@@ -37,7 +37,7 @@ from fastapi.responses import (
 MANIFEST = {
     "id": "audimo-soulseek",
     "name": "Audimo Soulseek",
-    "version": "0.1.7",
+    "version": "0.1.8",
     "description": (
         "Install and configure slskd, then search Soulseek peers "
         "directly from Audimo's source picker."
