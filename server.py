@@ -37,7 +37,7 @@ from fastapi.responses import (
 MANIFEST = {
     "id": "audimo-soulseek",
     "name": "Audimo Soulseek",
-    "version": "0.1.8",
+    "version": "0.1.9",
     "description": (
         "Install and configure slskd, then search Soulseek peers "
         "directly from Audimo's source picker."
@@ -495,6 +495,12 @@ def _write_slskd_yml(soulseek_username: str, soulseek_password: str, api_key: st
 soulseek:
   username: {soulseek_username!r}
   password: {soulseek_password!r}
+  # Don't relay other users' searches through this daemon. We don't
+  # share anything, so participating in the distributed search network
+  # only burns CPU + bandwidth.
+  distributed_network:
+    disabled: true
+    accept_children: false
 
 directories:
   downloads: {_SLSKD_DL_DIR!r}
@@ -572,6 +578,141 @@ async def _launchctl(action: str) -> bool:
     except Exception as e:
         print(f"[soulseek] launchctl {action} failed: {e}", flush=True)
         return False
+
+
+# ──────────────────────────────────────────────────────────────────
+# slskd lifecycle — child of this process, not a 24/7 daemon
+#
+# Earlier versions installed slskd as a LaunchAgent with KeepAlive,
+# so it ran continuously even when Audimo was closed. That left
+# hundreds of inbound Soulseek peer sockets open and burned 20-50%
+# CPU forever. The new model: spawn slskd as a child of server.py
+# when the addon starts, kill it when the addon stops. slskd's
+# lifecycle now matches the user's Audimo session.
+# ──────────────────────────────────────────────────────────────────
+_slskd_proc: subprocess.Popen | None = None
+_SLSKD_LOG_PATH = os.path.expanduser("~/.audimo/slskd/slskd.log")
+
+
+def _slskd_is_running() -> bool:
+    global _slskd_proc
+    return _slskd_proc is not None and _slskd_proc.poll() is None
+
+
+def _start_slskd() -> bool:
+    """Spawn slskd as a child of this process. Returns True if running."""
+    global _slskd_proc
+    if _slskd_is_running():
+        return True
+    if not (_slskd_installed() and os.path.exists(_SLSKD_CFG)):
+        return False
+    try:
+        os.makedirs(os.path.dirname(_SLSKD_LOG_PATH), exist_ok=True)
+        log_f = open(_SLSKD_LOG_PATH, "ab")
+        _slskd_proc = subprocess.Popen(
+            [_SLSKD_BIN, "--config", _SLSKD_CFG],
+            stdout=log_f, stderr=log_f,
+            stdin=subprocess.DEVNULL,
+            # Own process group so we can kill the whole subtree, and
+            # SIGTERM to our process doesn't accidentally hit slskd
+            # before our atexit handler can run cleanly.
+            start_new_session=True,
+            close_fds=True,
+        )
+        print(f"[soulseek] slskd spawned pid={_slskd_proc.pid}", flush=True)
+        return True
+    except Exception as e:
+        print(f"[soulseek] failed to spawn slskd: {e}", flush=True)
+        return False
+
+
+def _stop_slskd(timeout_s: float = 5.0) -> None:
+    global _slskd_proc
+    p = _slskd_proc
+    _slskd_proc = None
+    if not p or p.poll() is not None:
+        return
+    try:
+        p.terminate()
+        try:
+            p.wait(timeout=timeout_s)
+        except subprocess.TimeoutExpired:
+            p.kill()
+            try:
+                p.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                pass
+        print(f"[soulseek] slskd stopped (pid was {p.pid})", flush=True)
+    except Exception as e:
+        print(f"[soulseek] stop slskd: {e}", flush=True)
+
+
+async def _migrate_off_launchd() -> None:
+    """One-shot: unload + remove the old always-on LaunchAgent and
+    kill any orphan slskd it left behind. Safe to run on every boot."""
+    plist_present = os.path.exists(_LAUNCHD_PLIST)
+    if plist_present:
+        await _launchctl("unload")
+        try:
+            os.remove(_LAUNCHD_PLIST)
+            print(f"[soulseek] removed legacy LaunchAgent at {_LAUNCHD_PLIST}", flush=True)
+        except Exception as e:
+            print(f"[soulseek] could not remove old plist: {e}", flush=True)
+    # Belt-and-suspenders: kill any slskd that's already running but
+    # isn't ours (orphaned from a previous LaunchAgent session). Match
+    # by command line containing our config path.
+    try:
+        r = subprocess.run(
+            ["pgrep", "-f", f"slskd --config {_SLSKD_CFG}"],
+            capture_output=True, text=True, timeout=3,
+        )
+        for line in r.stdout.split():
+            try:
+                pid = int(line.strip())
+                if _slskd_proc and pid == _slskd_proc.pid:
+                    continue
+                os.kill(pid, 15)  # SIGTERM
+                print(f"[soulseek] terminated orphan slskd pid={pid}", flush=True)
+            except (ValueError, ProcessLookupError):
+                pass
+    except Exception:
+        pass
+
+
+@app.on_event("startup")
+async def _on_startup_slskd() -> None:
+    await _migrate_off_launchd()
+    # Brief settle so the orphan SIGTERM lands before we re-spawn.
+    await asyncio.sleep(0.5)
+    _start_slskd()
+
+
+@app.on_event("shutdown")
+async def _on_shutdown_slskd() -> None:
+    _stop_slskd()
+
+
+# atexit covers the case where the process is torn down without the
+# graceful FastAPI shutdown path (e.g. SIGKILL via Tauri sidecar
+# manager racing with our cleanup). Subprocess.Popen + start_new_session
+# means the child survives a parent crash, so atexit on TERM is the
+# only guarantee that slskd doesn't leak.
+import atexit as _atexit
+_atexit.register(_stop_slskd)
+
+import signal as _signal
+def _handle_term_signal(signum, _frame):
+    _stop_slskd()
+    # Let Python's default handler run after cleanup so the process
+    # actually exits.
+    _signal.signal(signum, _signal.SIG_DFL)
+    os.kill(os.getpid(), signum)
+
+for _sig in (_signal.SIGTERM, _signal.SIGINT, _signal.SIGHUP):
+    try:
+        _signal.signal(_sig, _handle_term_signal)
+    except (ValueError, OSError):
+        pass
 
 
 # ──────────────────────────────────────────────────────────────────
@@ -1309,21 +1450,18 @@ async def slskd_install(payload: dict = {}):
             _write_managed_api_key(api_key)
             _write_slskd_yml(soulseek_username, soulseek_password, api_key)
 
-            yield _sse({"type": "progress", "pct": 80, "message": "Installing launchd service…"})
+            yield _sse({"type": "progress", "pct": 85, "message": "Starting slskd…"})
 
-            _write_launchd_plist()
-            # Unload first in case an old version is loaded
-            await _launchctl("unload")
-            await asyncio.sleep(1)
-            ok = await _launchctl("load")
-            if not ok:
+            # No LaunchAgent — slskd runs as a child of this server.py
+            # process so its lifecycle matches the user's Audimo session.
+            # Migrate off any old LaunchAgent left from a prior install.
+            await _migrate_off_launchd()
+            await asyncio.sleep(0.5)
+            if not _start_slskd():
                 yield _sse({"type": "error",
-                            "message": "Installed slskd but could not start the launchd service. "
-                                       "Try: launchctl load ~/Library/LaunchAgents/com.audimo.slskd-runtime.plist"})
+                            "message": "Installed slskd but could not start it. Check ~/.audimo/slskd/slskd.log"})
                 return
-
-            yield _sse({"type": "progress", "pct": 90, "message": "Waiting for slskd to start…"})
-            await asyncio.sleep(5)
+            await asyncio.sleep(3)
 
             yield _sse({"type": "done", "message": f"slskd {tag} installed and running.", "version": tag})
 
@@ -1378,8 +1516,8 @@ async def slskd_update():
                                             "message": f"Downloading… {downloaded // 1024 // 1024}MB / {total // 1024 // 1024}MB"})
 
             yield _sse({"type": "progress", "pct": 67, "message": "Stopping slskd…"})
-            await _launchctl("unload")
-            await asyncio.sleep(2)
+            _stop_slskd()
+            await asyncio.sleep(1)
 
             yield _sse({"type": "progress", "pct": 72, "message": "Replacing binary…"})
             # Refresh wwwroot too — slskd's web UI assets are versioned
@@ -1394,7 +1532,7 @@ async def slskd_update():
             os.chmod(_SLSKD_BIN, 0o755)
 
             yield _sse({"type": "progress", "pct": 88, "message": "Restarting slskd…"})
-            await _launchctl("load")
+            _start_slskd()
             await asyncio.sleep(3)
 
             yield _sse({"type": "done", "message": f"Updated to slskd {tag}.", "version": tag})
@@ -1419,7 +1557,10 @@ async def slskd_save_credentials(payload: dict):
     api_key = _read_managed_api_key() or secrets.token_hex(32)
     _write_managed_api_key(api_key)
     _write_slskd_yml(soulseek_username, soulseek_password, api_key)
-    await _launchctl("kickstart")
+    # Restart slskd so the new credentials take effect.
+    _stop_slskd()
+    await asyncio.sleep(0.5)
+    _start_slskd()
     return {"ok": True}
 
 
